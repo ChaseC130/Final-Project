@@ -1,0 +1,26 @@
+# Lane Follower Configuration
+# Adjust these parameters based on your Edubot setup and environment
+
+lane_follower:
+  ros__parameters:
+    # Topic names
+    camera_topic: "/camera/image_raw"
+    cmd_vel_topic: "/cmd_vel"
+    
+    # Speed settings
+    linear_speed: 0.2          # Forward speed in m/s (start slow, increase as needed)
+    max_angular_speed: 0.5     # Maximum turning speed in rad/s
+    
+    # PID Controller Tuning
+    # Start with these values and adjust based on robot behavior:
+    # - If robot oscillates: reduce Kp, increase Kd
+    # - If robot responds slowly: increase Kp
+    # - If there's steady-state error: increase Ki (but keep small)
+    kp: 0.005                  # Proportional gain
+    ki: 0.0001                 # Integral gain (use carefully)
+    kd: 0.001                  # Derivative gain
+    
+    # Vision parameters
+    roi_height: 0.3            # Fraction of image to use (0.3 = bottom 30%)
+    min_line_length: 20        # Minimum line length for Hough detection (pixels)
+    max_line_gap: 10           # Maximum gap in line segments (pixels)
