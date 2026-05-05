@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>edubot_autonomy</name>
+  <version>0.1.0</version>
+  <description>Edubot autonomy package for lane following, mapping, and sign recognition.</description>
+  <maintainer email="you@example.com">edubot_team</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>cv_bridge</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
