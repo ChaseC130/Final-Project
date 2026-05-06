@@ -1,0 +1,929 @@
+#!/usr/bin/env python3
+"""
+EduBot Lane Follower  -  v8.9
+==============================
+
+FIX 1: ROBOT STEERS TOWARD YELLOW (attracted instead of repelled)
+------------------------------------------------------------------
+Root cause: when YELLOW-ONLY, target_x was set to the RIGHT of yellow cx:
+  target_x = ycx + gap - offset
+This places the robot's target TO THE RIGHT of yellow, meaning yellow
+is on the LEFT and robot steers left toward it.
+
+Yellow is the CENTER line. Robot must stay to the RIGHT of yellow.
+Fix: invert the yellow-only target so robot stays RIGHT of yellow:
+  target_x = ycx + gap + offset   (was minus offset)
+Also added yellow_attraction_guard: if yellow_cx > frame_center
+(yellow is on right half of frame), it means robot drifted left
+and yellow is close — ignore yellow-only steer and use grace instead.
+
+FIX 2: RECOVERY SWEEP LOOKS RIGHT FIRST (white line is on right)
+-----------------------------------------------------------------
+Old sweep: alternates left/right, starting left.
+New: sweep starts RIGHT (sweep_dir = -1), stays right for
+     sweep_right_priority_frames (default 20 frames) before
+     alternating. White line is on the right side of the lane,
+     so looking right first finds it faster.
+     Also: during recovery, robot moves slowly forward
+     (sweep_linear_speed=0.03 m/s) so it doesn't stay in one spot.
+
+v8.9 CHANGES
+-------------
+1. YELLOW STEERING FULLY DISABLED: raw_ycx forced to None after
+   detection. Robot follows white line only. Yellow detection still
+   runs internally (used in U-turn CREEP to find lane after spin).
+2. NO MORE FLICKERING: _publish_debug throttled to max 15fps via
+   _last_debug_t. Corner-commit and intersection blocks no longer
+   do their own self.debug_pub.publish() calls — single publish
+   path only.
+3. SMOOTH DRIVING: kp_scale and deadband always use white_only
+   values since that is the only steering mode.
+"""
+
+import time
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Bool, String
+from cv_bridge import CvBridge
+from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
+import cv2
+import numpy as np
+
+CAMERA_TOPIC  = '/camera_1/image_raw'
+CMD_VEL_TOPIC = '/cmd_vel'
+DEBUG_TOPIC   = '/lane_debug/image_raw'
+
+UT_IDLE    = 0
+UT_BRAKE   = 1
+UT_SEG1    = 2   # legacy (kept for compat)
+UT_SEG2    = 3
+UT_SEG3    = 4
+UT_STR     = 5
+# Orange-guided U-turn states
+UT_SPIN    = 10  # spin left while orange visible
+UT_CREEP   = 11  # orange gone -> creep forward until lane found
+
+
+
+class LaneFollower(Node):
+
+    def __init__(self):
+        super().__init__('lane_follower')
+        self.bridge = CvBridge()
+
+        self._white_confirm_count  = 0
+        self._white_confirmed      = False
+        self._prev_white_cx        = None
+        self._prev_yellow_cx       = None
+        self._yellow_cx_smooth     = None
+        self._last_error           = None
+        self._lost_frames          = 0
+        self._prev_angular         = 0.0
+        self._prev_error           = 0.0
+        self._corner_commit_frames = 0
+        self._corner_commit_dir    = 0
+        self._prev_mode            = 'NONE'
+        self._orange_confirm_count = 0
+        self._uturn_phase          = UT_IDLE
+        self._uturn_phase_end_t    = 0.0
+        self._uturn_cooldown_end_t = 0.0
+        self._spin_orange_lost_frames = 0
+        self._right_watch_count     = 0
+        self._intersection_pending   = False
+        self._intersection_direction = 'right'
+        self._obstacle_state         = 'CLEAR'
+        self._intersection_commit_frames = 0
+        self._last_white_cx_for_right  = None
+
+        # Sweep state — starts RIGHT (-1) since white is on right
+        self._sweep_dir              = -1
+        self._sweep_frame_count      = 0
+        self._sweep_right_done       = False
+        self._last_debug_t           = 0.0   # flickering fix: throttle debug pub
+
+        def p(desc):
+            return ParameterDescriptor(description=desc)
+
+        # ── White HSV ─────────────────────────────────────────────────────────
+        self.declare_parameter('white_h_min', 0,   p(''))
+        self.declare_parameter('white_h_max', 180, p(''))
+        self.declare_parameter('white_s_min', 0,   p(''))
+        self.declare_parameter('white_s_max', 25,  p(''))
+        self.declare_parameter('white_v_min', 200, p(''))
+        self.declare_parameter('white_v_max', 255, p(''))
+
+        # ── Yellow HSV ────────────────────────────────────────────────────────
+        self.declare_parameter('yellow_h_min', 18,  p(''))
+        self.declare_parameter('yellow_h_max', 38,  p(''))
+        self.declare_parameter('yellow_s_min', 150, p(''))
+        self.declare_parameter('yellow_s_max', 255, p(''))
+        self.declare_parameter('yellow_v_min', 140, p(''))
+        self.declare_parameter('yellow_v_max', 255, p(''))
+
+        # ── Yellow attraction guard ────────────────────────────────────────────
+        self.declare_parameter('yellow_attraction_guard', True,
+            p('If True: ignore yellow steer when yellow_cx > frame_center '
+              '(robot drifting toward yellow). Uses grace/sweep instead.'))
+        self.declare_parameter('yellow_guard_frac', 0.52,
+            p('Fraction of frame width. Yellow cx > this triggers guard. '
+              'Default 0.52 (just past center). Lower = more aggressive guard.'))
+
+        # ── Orange HSV ────────────────────────────────────────────────────────
+        self.declare_parameter('orange_h_min', 8,   p(''))
+        self.declare_parameter('orange_h_max', 18,  p(''))
+        self.declare_parameter('orange_s_min', 180, p(''))
+        self.declare_parameter('orange_s_max', 255, p(''))
+        self.declare_parameter('orange_v_min', 150, p(''))
+        self.declare_parameter('orange_v_max', 255, p(''))
+        self.declare_parameter('orange_min_area', 1500, p(''))
+        self.declare_parameter('orange_min_width_frac', 0.25, p(''))
+        self.declare_parameter('orange_confirm_frames', 2, p(''))
+        self.declare_parameter('orange_roi_bottom_frac', 0.60, p(''))
+
+        # ── U-TURN (time-based) ───────────────────────────────────────────────
+        self.declare_parameter('uturn_brake_secs', 0.3, p(''))
+        self.declare_parameter('uturn_seg1_secs', 2.0, p('SEG1 arc-left seconds'))
+        self.declare_parameter('uturn_seg1_speed', 0.20, p('SEG1 forward speed m/s'))
+        self.declare_parameter('uturn_seg1_angular', 0.28,
+            p('SEG1 left rate. LOWER=WIDER. 0.28->r=0.71m. 0.25->r=0.80m'))
+        self.declare_parameter('uturn_seg2_secs', 2.2, p('SEG2 straight seconds -- increase to cover more'))
+        self.declare_parameter('uturn_seg2_speed', 0.18, p('SEG2 forward speed m/s'))
+        self.declare_parameter('uturn_seg3_secs', 2.0, p('SEG3 arc-left seconds'))
+        self.declare_parameter('uturn_seg3_speed', 0.20, p('SEG3 forward speed m/s'))
+        self.declare_parameter('uturn_seg3_angular', 0.28, p('SEG3 left rate rad/s'))
+        self.declare_parameter('uturn_str_secs', 0.6, p(''))
+        self.declare_parameter('uturn_str_speed', 0.10, p(''))
+        self.declare_parameter('uturn_cooldown_secs', 2.5, p(''))
+
+        # ── Orange-guided U-turn ───────────────────────────────────────────────
+        self.declare_parameter('uturn_spin_angular', 0.75,
+            p('Spin rate rad/s while orange is visible. Higher = faster turn.'))
+        self.declare_parameter('uturn_spin_speed', 0.70,
+            p('Forward speed during spin. 0 = pure spin in place.'))
+        self.declare_parameter('uturn_creep_speed', 0.10,
+            p('Forward speed after orange disappears, looking for lane.'))
+        self.declare_parameter('uturn_creep_angular', 0.12,
+            p('Small left drift during creep to stay in lane area.'))
+        self.declare_parameter('uturn_orange_lost_confirm', 4,
+            p('Frames orange must be absent before leaving spin phase.'))
+        self.declare_parameter('uturn_creep_timeout_secs', 5.0,
+            p('Max seconds in creep phase before giving up and resuming lane follow.'))
+        self.declare_parameter('uturn_mode', 'orange',
+            p('"orange" = new orange-guided mode (default). "timed" = legacy timed arc mode.'))
+
+        # ── Yellow blob ───────────────────────────────────────────────────────
+        self.declare_parameter('yellow_shape_min_area', 800, p(''))
+        self.declare_parameter('yellow_top_n_blobs', 3, p(''))
+        self.declare_parameter('yellow_ema_alpha', 0.4, p(''))
+
+        # ── ROI ───────────────────────────────────────────────────────────────
+        self.declare_parameter('roi_top_frac', 0.35, p(''))
+        self.declare_parameter('white_valid_x_start_frac', 0.20, p(''))
+        self.declare_parameter('white_min_height_px', 8, p(''))
+        self.declare_parameter('white_confirm_frames', 1, p(''))
+        self.declare_parameter('max_cx_jump_px', 160, p(''))
+        self.declare_parameter('min_area', 200, p(''))
+        self.declare_parameter('min_width', 6, p(''))
+        self.declare_parameter('lost_grace_frames', 15, p(''))
+        self.declare_parameter('warp_enabled', True, p(''))
+        self.declare_parameter('warp_strength', 0.20, p(''))
+
+        # ── Lane position ──────────────────────────────────────────────────────
+        self.declare_parameter('camera_offset_px', 65, p(''))
+        self.declare_parameter('lane_bias_px', 85,
+            p('Left bias px. Raise to 100+ if still on white.'))
+        self.declare_parameter('white_only_gap_frac', 0.28, p(''))
+        self.declare_parameter('yellow_only_gap_frac', 0.22, p(''))
+        self.declare_parameter('lane_center_bias_frac', 0.12, p(''))
+
+        # ── PD controller ─────────────────────────────────────────────────────
+        self.declare_parameter('kp', 0.003, p(''))
+        self.declare_parameter('kd', 0.001, p(''))
+        self.declare_parameter('max_angular', 0.55, p(''))
+        self.declare_parameter('error_deadband_px', 30, p(''))
+        self.declare_parameter('angular_lowpass_alpha', 0.45, p(''))
+        self.declare_parameter('white_only_kp_scale', 0.5, p(''))
+        self.declare_parameter('white_only_deadband_px', 50, p(''))
+
+        # ── Normal driving ────────────────────────────────────────────────────
+        self.declare_parameter('linear_speed', 0.12, p(''))
+        self.declare_parameter('turn_speed', 0.07, p(''))
+
+        # ── Corner commit ──────────────────────────────────────────────────────
+        self.declare_parameter('spread_turn_threshold', 0.38, p(''))
+        self.declare_parameter('corner_commit_frames', 26, p(''))
+        self.declare_parameter('corner_commit_angular', 0.52, p(''))
+        self.declare_parameter('corner_commit_speed', 0.13, p(''))
+
+        # ── Intersection turn ─────────────────────────────────────────────────
+        self.declare_parameter('intersection_commit_frames', 28, p(''))
+        self.declare_parameter('intersection_commit_angular', -0.55, p(''))
+        self.declare_parameter('intersection_commit_speed', 0.10, p(''))
+
+        # ── Sharp right watch ─────────────────────────────────────────────────
+        self.declare_parameter('right_turn_watch_frac', 0.88, p(''))
+        self.declare_parameter('right_turn_watch_frames', 3, p(''))
+        self.declare_parameter('right_turn_commit_frames', 20, p(''))
+        self.declare_parameter('right_turn_commit_angular', 0.58, p(''))
+        self.declare_parameter('right_turn_commit_speed', 0.10, p(''))
+        self.declare_parameter('right_turn_loss_commit_frames', 26, p(''))
+        self.declare_parameter('right_turn_loss_memory_frames', 10, p(''))
+        self.declare_parameter('right_turn_entry_speed', 0.06, p(''))
+        self.declare_parameter('right_turn_follow_gain', 1.35, p(''))
+
+        # ── Recovery sweep ─────────────────────────────────────────────────────
+        self.declare_parameter('sweep_angular', 0.22, p(''))
+        self.declare_parameter('sweep_frames_per_dir', 10, p(''))
+        self.declare_parameter('sweep_right_priority_frames', 20, p(''))
+        self.declare_parameter('sweep_linear_speed', 0.03, p(''))
+
+        self.add_on_set_parameters_callback(self.param_callback)
+        self.load_params()
+
+        self.sub = self.create_subscription(Image, CAMERA_TOPIC, self.image_cb, 1)
+        self.sub_intersect = self.create_subscription(
+            Bool, '/intersection_detected', self._intersection_cb, 10)
+        self.sub_dir       = self.create_subscription(
+            String, '/turn_direction', self._direction_cb, 10)
+        self.sub_obstacle  = self.create_subscription(
+            String, '/obstacle_state', self._obstacle_cb, 10)
+        self.pub_lane = self.create_publisher(Twist, '/cmd_vel_lane', 10)
+        self.pub = self.create_publisher(Twist, CMD_VEL_TOPIC, 10)
+        self.debug_pub = self.create_publisher(Image, DEBUG_TOPIC, 1)
+
+        r1 = self.uturn_seg1_speed / max(self.uturn_seg1_angular, 0.01)
+        self.get_logger().info(
+            f'EduBot lane follower v8.9 -- WHITE-ONLY, single debug publish\n'
+            f'  Yellow detection runs but does NOT affect steering\n'
+            f'  Debug overlay throttled to 15fps -- no flickering\n'
+            f'  U-turn arc radius: {r1:.2f}m, cross-straight: {self.uturn_seg2_secs:.1f}s\n'
+            f'  Lane offset: {self.total_offset_px}px\n'
+        )
+
+    # ── Parameters ────────────────────────────────────────────────────────────
+
+    def load_params(self):
+        gp = self.get_parameter
+        self.white_lower  = np.array([gp('white_h_min').value, gp('white_s_min').value,
+                                       gp('white_v_min').value], dtype=np.uint8)
+        self.white_upper  = np.array([gp('white_h_max').value, gp('white_s_max').value,
+                                       gp('white_v_max').value], dtype=np.uint8)
+        self.yellow_lower = np.array([gp('yellow_h_min').value, gp('yellow_s_min').value,
+                                       gp('yellow_v_min').value], dtype=np.uint8)
+        self.yellow_upper = np.array([gp('yellow_h_max').value, gp('yellow_s_max').value,
+                                       gp('yellow_v_max').value], dtype=np.uint8)
+        self.orange_lower = np.array([gp('orange_h_min').value, gp('orange_s_min').value,
+                                       gp('orange_v_min').value], dtype=np.uint8)
+        self.orange_upper = np.array([gp('orange_h_max').value, gp('orange_s_max').value,
+                                       gp('orange_v_max').value], dtype=np.uint8)
+        self.yellow_attraction_guard    = bool(gp('yellow_attraction_guard').value)
+        self.yellow_guard_frac          = float(gp('yellow_guard_frac').value)
+        self.orange_min_area            = int(gp('orange_min_area').value)
+        self.orange_min_width_frac      = float(gp('orange_min_width_frac').value)
+        self.orange_confirm_frames      = int(gp('orange_confirm_frames').value)
+        self.orange_roi_bottom_frac     = float(gp('orange_roi_bottom_frac').value)
+        self.uturn_brake_secs           = float(gp('uturn_brake_secs').value)
+        self.uturn_seg1_secs            = float(gp('uturn_seg1_secs').value)
+        self.uturn_seg1_speed           = float(gp('uturn_seg1_speed').value)
+        self.uturn_seg1_angular         = float(gp('uturn_seg1_angular').value)
+        self.uturn_seg2_secs            = float(gp('uturn_seg2_secs').value)
+        self.uturn_seg2_speed           = float(gp('uturn_seg2_speed').value)
+        self.uturn_seg3_secs            = float(gp('uturn_seg3_secs').value)
+        self.uturn_seg3_speed           = float(gp('uturn_seg3_speed').value)
+        self.uturn_seg3_angular         = float(gp('uturn_seg3_angular').value)
+        self.uturn_str_secs             = float(gp('uturn_str_secs').value)
+        self.uturn_str_speed            = float(gp('uturn_str_speed').value)
+        self.uturn_cooldown_secs        = float(gp('uturn_cooldown_secs').value)
+        self.uturn_spin_angular         = float(gp('uturn_spin_angular').value)
+        self.uturn_spin_speed           = float(gp('uturn_spin_speed').value)
+        self.uturn_creep_speed          = float(gp('uturn_creep_speed').value)
+        self.uturn_creep_angular        = float(gp('uturn_creep_angular').value)
+        self.uturn_orange_lost_confirm  = int(gp('uturn_orange_lost_confirm').value)
+        self.uturn_creep_timeout_secs   = float(gp('uturn_creep_timeout_secs').value)
+        self.uturn_mode                 = str(gp('uturn_mode').value)
+        self.yellow_shape_min_area      = int(gp('yellow_shape_min_area').value)
+        self.yellow_top_n_blobs         = int(gp('yellow_top_n_blobs').value)
+        self.yellow_ema_alpha           = float(gp('yellow_ema_alpha').value)
+        self.roi_top_frac               = float(gp('roi_top_frac').value)
+        self.white_valid_x_start_frac   = float(gp('white_valid_x_start_frac').value)
+        self.white_min_height_px        = int(gp('white_min_height_px').value)
+        self.white_confirm_frames       = int(gp('white_confirm_frames').value)
+        self.max_cx_jump_px             = int(gp('max_cx_jump_px').value)
+        self.min_area                   = int(gp('min_area').value)
+        self.min_width                  = int(gp('min_width').value)
+        self.lost_grace_frames          = int(gp('lost_grace_frames').value)
+        self.warp_enabled               = bool(gp('warp_enabled').value)
+        self.warp_strength              = float(gp('warp_strength').value)
+        self.camera_offset_px           = int(gp('camera_offset_px').value)
+        self.lane_bias_px               = int(gp('lane_bias_px').value)
+        self.white_only_gap_frac        = float(gp('white_only_gap_frac').value)
+        self.yellow_only_gap_frac       = float(gp('yellow_only_gap_frac').value)
+        self.lane_center_bias_frac      = float(gp('lane_center_bias_frac').value)
+        self.kp                         = float(gp('kp').value)
+        self.kd                         = float(gp('kd').value)
+        self.max_angular                = float(gp('max_angular').value)
+        self.error_deadband_px          = float(gp('error_deadband_px').value)
+        self.angular_lowpass_alpha      = float(gp('angular_lowpass_alpha').value)
+        self.white_only_kp_scale        = float(gp('white_only_kp_scale').value)
+        self.white_only_deadband_px     = float(gp('white_only_deadband_px').value)
+        self.linear_speed               = float(gp('linear_speed').value)
+        self.turn_speed                 = float(gp('turn_speed').value)
+        self.spread_turn_threshold      = float(gp('spread_turn_threshold').value)
+        self.corner_commit_frames       = int(gp('corner_commit_frames').value)
+        self.corner_commit_angular      = float(gp('corner_commit_angular').value)
+        self.corner_commit_speed        = float(gp('corner_commit_speed').value)
+        self.intersection_commit_frames  = int(gp('intersection_commit_frames').value)
+        self.intersection_commit_angular = float(gp('intersection_commit_angular').value)
+        self.intersection_commit_speed   = float(gp('intersection_commit_speed').value)
+        self.right_turn_watch_frac      = float(gp('right_turn_watch_frac').value)
+        self.right_turn_watch_frames    = int(gp('right_turn_watch_frames').value)
+        self.right_turn_commit_frames   = int(gp('right_turn_commit_frames').value)
+        self.right_turn_commit_angular  = float(gp('right_turn_commit_angular').value)
+        self.right_turn_commit_speed    = float(gp('right_turn_commit_speed').value)
+        self.right_turn_loss_commit_frames = int(gp('right_turn_loss_commit_frames').value)
+        self.right_turn_loss_memory_frames = int(gp('right_turn_loss_memory_frames').value)
+        self.right_turn_entry_speed     = float(gp('right_turn_entry_speed').value)
+        self.right_turn_follow_gain     = float(gp('right_turn_follow_gain').value)
+        self.sweep_angular              = float(gp('sweep_angular').value)
+        self.sweep_frames_per_dir       = int(gp('sweep_frames_per_dir').value)
+        self.sweep_right_priority_frames= int(gp('sweep_right_priority_frames').value)
+        self.sweep_linear_speed         = float(gp('sweep_linear_speed').value)
+        self.total_offset_px            = self.camera_offset_px + self.lane_bias_px
+
+    def param_callback(self, params):
+        self.load_params()
+        return SetParametersResult(successful=True)
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _now(self):
+        return time.monotonic()
+
+    def _warp_birdseye(self, img):
+        h, w  = img.shape[:2]
+        inset = int(w * 0.30 * self.warp_strength)
+        src = np.float32([[inset,0],[w-inset,0],[w,h],[0,h]])
+        dst = np.float32([[0,0],[w,0],[w,h],[0,h]])
+        M   = cv2.getPerspectiveTransform(src, dst)
+        return cv2.warpPerspective(img, M, (w,h),
+                                   flags=cv2.INTER_LINEAR,
+                                   borderMode=cv2.BORDER_REPLICATE)
+
+    def _clean_mask(self, mask, close_iters=3):
+        k3 = cv2.getStructuringElement(cv2.MORPH_RECT,(3,3))
+        k7 = cv2.getStructuringElement(cv2.MORPH_RECT,(7,7))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k3, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k7, iterations=close_iters)
+        return mask
+
+    def _arc_cmd(self, linear, angular):
+        t = Twist()
+        t.linear.x  = float(linear)
+        t.angular.z = float(angular)
+        self.pub.publish(t)
+
+    def _reset_pd(self):
+        self._prev_angular = 0.0
+        self._prev_error   = 0.0
+
+    def _advance_uturn(self, next_phase, duration):
+        self._uturn_phase       = next_phase
+        self._uturn_phase_end_t = self._now() + duration
+
+    def _uturn_debug(self, frame, roi_y, label, detail):
+        h, w = frame.shape[:2]
+        dbg  = frame.copy()
+        cv2.line(dbg,(0,roi_y),(w,roi_y),(60,60,60),1)
+        cv2.putText(dbg,label,(15,38),cv2.FONT_HERSHEY_SIMPLEX,0.88,(0,80,255),2)
+        cv2.putText(dbg,detail,(15,66),cv2.FONT_HERSHEY_SIMPLEX,0.42,(200,200,200),1)
+        rem = max(0.0, self._uturn_phase_end_t - self._now())
+        cv2.putText(dbg,f'remaining: {rem:.2f}s',
+                    (15,90),cv2.FONT_HERSHEY_SIMPLEX,0.55,(0,180,255),2)
+        r1 = self.uturn_seg1_speed/max(self.uturn_seg1_angular,0.01)
+        cv2.putText(dbg,
+            f'ARC-r={r1:.2f}m  SEG2={self.uturn_seg2_secs:.1f}s straight',
+            (15,h-10),cv2.FONT_HERSHEY_SIMPLEX,0.40,(160,200,160),1)
+        segs   = ['BRK','ARC-L','CROSS','ARC-L','ALIGN']
+        pi_map = {UT_BRAKE:0,UT_SEG1:1,UT_SEG2:2,UT_SEG3:3,UT_STR:4}
+        ci = pi_map.get(self._uturn_phase,-1)
+        bx = 15
+        for i,s in enumerate(segs):
+            col = (0,200,80) if i==ci else (80,80,80)
+            tc  = (255,255,255) if i==ci else (140,140,140)
+            cv2.rectangle(dbg,(bx,h-30),(bx+56,h-14),col,-1)
+            cv2.putText(dbg,s,(bx+3,h-16),cv2.FONT_HERSHEY_SIMPLEX,0.32,tc,1)
+            bx += 62
+        self.debug_pub.publish(self.bridge.cv2_to_imgmsg(dbg,encoding='bgr8'))
+
+    # ── Orange detection ───────────────────────────────────────────────────────
+
+    def detect_orange(self, hsv_roi, roi_w, roi_h):
+        if self._now() < self._uturn_cooldown_end_t:
+            return False, None
+        y0      = int(roi_h*(1.0-self.orange_roi_bottom_frac))
+        crop    = hsv_roi[y0:,:]
+        mask    = cv2.inRange(crop, self.orange_lower, self.orange_upper)
+        mask    = self._clean_mask(mask, close_iters=2)
+        cnts,_  = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best = None
+        for c in cnts:
+            area = cv2.contourArea(c)
+            if area < self.orange_min_area: continue
+            _,_,cw,_ = cv2.boundingRect(c)
+            if cw < roi_w*self.orange_min_width_frac: continue
+            if best is None or area > best[0]: best=(area,c,y0)
+        if best is None:
+            self._orange_confirm_count = 0
+            return False, None
+        self._orange_confirm_count += 1
+        return (self._orange_confirm_count >= self.orange_confirm_frames), best
+
+    # ── White detection ────────────────────────────────────────────────────────
+
+    def get_cx_white(self, mask, fw):
+        mask    = self._clean_mask(mask)
+        cnts,_  = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        x_min   = int(fw*self.white_valid_x_start_frac)
+        valid   = []
+        for c in cnts:
+            area = cv2.contourArea(c)
+            if area < self.min_area: continue
+            _,_,cw,ch = cv2.boundingRect(c)
+            if cw < self.min_width or ch < self.white_min_height_px: continue
+            M = cv2.moments(c)
+            if M['m00']==0: continue
+            bx = int(M['m10']/M['m00'])
+            if bx < x_min: continue
+            valid.append((area,c,bx))
+        if not valid: return None,[]
+        valid.sort(key=lambda x:x[0],reverse=True)
+        top = sorted(valid[:2],key=lambda x:x[2],reverse=True)
+        return top[0][2],[v[1] for v in valid]
+
+    # ── Yellow detection (used ONLY in U-turn CREEP phase) ────────────────────
+
+    def get_cx_yellow(self, mask):
+        mask    = self._clean_mask(mask, close_iters=4)
+        cnts,_  = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        valid   = []
+        for c in cnts:
+            area = cv2.contourArea(c)
+            if area < self.min_area: continue
+            _,_,cw,ch = cv2.boundingRect(c)
+            if cw < self.min_width: continue
+            if not (ch >= cw*0.3 or area >= self.yellow_shape_min_area): continue
+            valid.append((area,c))
+        if not valid: return None,[]
+        valid.sort(key=lambda x:x[0],reverse=True)
+        tw=0.0; wcx=0.0
+        for _,c in valid[:self.yellow_top_n_blobs]:
+            M = cv2.moments(c)
+            if M['m00']==0: continue
+            wcx += (M['m10']/M['m00'])*M['m00']
+            tw  += M['m00']
+        if tw==0: return None,[v[1] for v in valid]
+        raw = int(wcx/tw)
+        a   = self.yellow_ema_alpha
+        self._yellow_cx_smooth = raw if self._yellow_cx_smooth is None \
+                                  else a*raw+(1-a)*self._yellow_cx_smooth
+        return int(self._yellow_cx_smooth),[v[1] for v in valid]
+
+    # ── PD ────────────────────────────────────────────────────────────────────
+
+    def _compute_angular(self, error, kp_scale=1.0, deadband=None):
+        db  = deadband if deadband is not None else self.error_deadband_px
+        dz  = 0.0 if abs(error)<db else (1 if error>0 else -1)*(abs(error)-db)
+        raw = float(np.clip(-(self.kp*kp_scale)*dz-self.kd*(error-self._prev_error),
+                            -self.max_angular, self.max_angular))
+        sm  = self.angular_lowpass_alpha*raw+(1-self.angular_lowpass_alpha)*self._prev_angular
+        self._prev_error   = error
+        self._prev_angular = sm
+        return sm
+
+    # ── Debug overlay (single publish path, throttled to 15fps) ───────────────
+
+    def _publish_debug(self, frame, roi_y, rh, rw,
+                       w_cnts, y_cnts, o_info,
+                       w_cx, y_cx, target_x,
+                       status, mode, spread_str, error, y_guarded):
+        # Throttle to ~15 fps -- stops flickering from multiple publish sources
+        _t = self._now()
+        if _t - self._last_debug_t < 0.066:
+            return
+        self._last_debug_t = _t
+        h, fw = frame.shape[:2]
+        dbg   = frame.copy()
+        my    = roi_y + rh//2
+
+        cv2.line(dbg,(0,roi_y),(fw,roi_y),(60,60,60),1)
+        cv2.line(dbg,(int(rw*self.white_valid_x_start_frac),roi_y),
+                     (int(rw*self.white_valid_x_start_frac),h),(60,60,200),1)
+        if self.yellow_attraction_guard:
+            gx = int(rw*self.yellow_guard_frac)
+            cv2.line(dbg,(gx,roi_y),(gx,h),(0,80,255),1)
+            cv2.putText(dbg,'Y-guard',(gx+2,roi_y+14),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.35,(0,80,255),1)
+        rx = int(rw*self.right_turn_watch_frac)
+        cv2.line(dbg,(rx,roi_y),(rx,h),(255,120,0),1)
+        cv2.putText(dbg,'R-watch',(max(0,rx-42),roi_y+28),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.35,(255,120,0),1)
+
+        if w_cnts:
+            col = (0,220,255) if self._white_confirmed else (60,60,255)
+            cv2.drawContours(dbg,[c+np.array([[[0,roi_y]]]) for c in w_cnts],-1,col,3)
+
+        if o_info:
+            _,oc,yo = o_info
+            cv2.drawContours(dbg,[oc+np.array([[[0,roi_y+yo]]])],-1,(0,80,255),4)
+
+        if w_cx is not None:
+            col = (0,220,255) if self._white_confirmed else (60,60,255)
+            cv2.circle(dbg,(w_cx,my),14,col,-1)
+            cv2.putText(dbg,f'W={w_cx}',(max(0,w_cx-55),my-20),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.7,col,2)
+
+        cv2.line(dbg,(fw//2,0),(fw//2,h),(120,120,120),1)
+        if target_x is not None:
+            tx = int(np.clip(target_x,0,fw-1))
+            cv2.circle(dbg,(tx,my),10,(0,255,0),-1)
+            cv2.line(dbg,(tx,0),(tx,h),(0,255,0),2)
+
+        err_s = f'  err={error:+.0f}' if error is not None else ''
+        full  = status + err_s + spread_str
+        sc    = (0,200,0) if (error is not None and abs(error)<self.error_deadband_px) \
+           else (0,165,255) if mode=='WHITE-ONLY' \
+           else (0,60,255)
+        cv2.putText(dbg,full,(15,36),cv2.FONT_HERSHEY_SIMPLEX,0.82,sc,2)
+        r1 = self.uturn_seg1_speed/max(self.uturn_seg1_angular,0.01)
+        cv2.putText(dbg,
+            f'offset:{self.total_offset_px}px  uturn_r:{r1:.2f}m  mode:{mode}  '
+            f'sweep:{"R" if self._sweep_dir<0 else "L"}',
+            (15,62),cv2.FONT_HERSHEY_SIMPLEX,0.36,(200,200,200),1)
+        cv2.putText(dbg,
+            f'W s_max:{self.white_upper[1]}  kp:{self.kp:.4f}  v8.9-WHITE-ONLY',
+            (10,h-10),cv2.FONT_HERSHEY_SIMPLEX,0.36,(200,200,200),1)
+        self.debug_pub.publish(self.bridge.cv2_to_imgmsg(dbg,encoding='bgr8'))
+
+    def _intersection_cb(self, msg: Bool):
+        if msg.data and self._intersection_commit_frames == 0:
+            self._intersection_pending = True
+            self.get_logger().info('Intersection detected -- queuing turn')
+
+    def _direction_cb(self, msg: String):
+        self._intersection_direction = msg.data.strip().lower()
+
+    def _obstacle_cb(self, msg: String):
+        self._obstacle_state = msg.data.strip().upper()
+
+    # ── Main callback ──────────────────────────────────────────────────────────
+
+    def image_cb(self, msg: Image):
+        now   = self._now()
+        frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        h, w  = frame.shape[:2]
+        roi_y = int(h * self.roi_top_frac)
+        roi   = frame[roi_y:, :]
+        rh, rw = roi.shape[:2]
+
+        # ── ORANGE-GUIDED SPIN ────────────────────────────────────────────────
+        if self._uturn_phase == UT_SPIN:
+            roi_y_sp  = int(frame.shape[0] * self.roi_top_frac)
+            roi_sp    = frame[roi_y_sp:, :]
+            rh_sp, rw_sp = roi_sp.shape[:2]
+            hsv_sp    = cv2.cvtColor(cv2.GaussianBlur(roi_sp,(5,5),0), cv2.COLOR_BGR2HSV)
+            o_ok_sp, _ = self.detect_orange(hsv_sp, rw_sp, rh_sp)
+            seeing_orange = o_ok_sp
+            dbg_sp = frame.copy()
+            col_sp = (0,200,80) if seeing_orange else (0,60,255)
+            lbl_sp = 'U-TURN: SPINNING (orange visible)' if seeing_orange \
+                else f'U-TURN: SPINNING (orange gone {self._spin_orange_lost_frames}/{self.uturn_orange_lost_confirm})'
+            cv2.putText(dbg_sp,lbl_sp,(15,38),cv2.FONT_HERSHEY_SIMPLEX,0.80,col_sp,2)
+            cv2.putText(dbg_sp,f'spin_angular={self.uturn_spin_angular:.2f}  mode=orange-guided',
+                        (15,64),cv2.FONT_HERSHEY_SIMPLEX,0.40,(200,200,200),1)
+            self.debug_pub.publish(self.bridge.cv2_to_imgmsg(dbg_sp,encoding='bgr8'))
+            if seeing_orange:
+                self._spin_orange_lost_frames = 0
+                self._arc_cmd(self.uturn_spin_speed, self.uturn_spin_angular)
+            else:
+                self._spin_orange_lost_frames += 1
+                self._arc_cmd(self.uturn_spin_speed, self.uturn_spin_angular)
+                if self._spin_orange_lost_frames >= self.uturn_orange_lost_confirm:
+                    self._uturn_phase       = UT_CREEP
+                    self._uturn_phase_end_t = self._now() + self.uturn_creep_timeout_secs
+                    self._spin_orange_lost_frames = 0
+                    self.get_logger().info('Orange gone -- entering CREEP to find lane')
+            return
+
+        # ── ORANGE-GUIDED CREEP ───────────────────────────────────────────────
+        if self._uturn_phase == UT_CREEP:
+            roi_y_cr  = int(frame.shape[0] * self.roi_top_frac)
+            roi_cr    = frame[roi_y_cr:, :]
+            rh_cr, rw_cr = roi_cr.shape[:2]
+            warped_cr = self._warp_birdseye(roi_cr) if self.warp_enabled else roi_cr
+            hsv_cr    = cv2.cvtColor(cv2.GaussianBlur(warped_cr,(5,5),0), cv2.COLOR_BGR2HSV)
+            wm_cr     = cv2.inRange(hsv_cr, self.white_lower,  self.white_upper)
+            ym_cr     = cv2.inRange(hsv_cr, self.yellow_lower, self.yellow_upper)
+            wcx_cr, _ = self.get_cx_white(wm_cr, rw_cr)
+            ycx_cr, _ = self.get_cx_yellow(ym_cr)
+            lane_found = (wcx_cr is not None) or (ycx_cr is not None)
+            timed_out  = (self._now() >= self._uturn_phase_end_t)
+            rem_cr     = max(0.0, self._uturn_phase_end_t - self._now())
+            dbg_cr = frame.copy()
+            col_cr = (0,200,80) if lane_found else (0,165,255)
+            lbl_cr = 'U-TURN: CREEP -- LANE FOUND!' if lane_found \
+                else f'U-TURN: CREEPING (timeout {rem_cr:.1f}s)'
+            cv2.putText(dbg_cr,lbl_cr,(15,38),cv2.FONT_HERSHEY_SIMPLEX,0.80,col_cr,2)
+            if wcx_cr: cv2.circle(dbg_cr,(wcx_cr, roi_y_cr+rh_cr//2),14,(0,220,255),-1)
+            if ycx_cr: cv2.circle(dbg_cr,(ycx_cr, roi_y_cr+rh_cr//2),14,(0,200,80),-1)
+            self.debug_pub.publish(self.bridge.cv2_to_imgmsg(dbg_cr,encoding='bgr8'))
+            if lane_found or timed_out:
+                if timed_out and not lane_found:
+                    self.get_logger().warn('Creep timed out -- resuming lane follow anyway')
+                else:
+                    self.get_logger().info('Lane found after U-turn -- resuming follow')
+                self._uturn_phase          = UT_IDLE
+                self._uturn_cooldown_end_t = self._now() + self.uturn_cooldown_secs
+                self._orange_confirm_count = 0
+                self._yellow_cx_smooth     = None
+                self._spin_orange_lost_frames = 0
+                self._sweep_dir            = -1
+                self._sweep_right_done     = False
+                self._right_watch_count    = 0
+                self._reset_pd()
+                return
+            self._arc_cmd(self.uturn_creep_speed, self.uturn_creep_angular)
+            return
+
+        if self._uturn_phase == UT_BRAKE:
+            r1 = self.uturn_seg1_speed/max(self.uturn_seg1_angular,0.01)
+            self._uturn_debug(frame,roi_y,'U-TURN ① STOPPING',
+                f'Next: ARC-LEFT {self.uturn_seg1_secs:.1f}s  r={r1:.2f}m')
+            self.pub.publish(Twist())
+            if now >= self._uturn_phase_end_t:
+                self._advance_uturn(UT_SEG1, self.uturn_seg1_secs)
+            return
+
+        if self._uturn_phase == UT_SEG1:
+            r1 = self.uturn_seg1_speed/max(self.uturn_seg1_angular,0.01)
+            self._uturn_debug(frame,roi_y,f'U-TURN ② ARC-LEFT  r={r1:.2f}m',
+                f'linear={self.uturn_seg1_speed:.2f}  angular=+{self.uturn_seg1_angular:.2f}  '
+                f'WIDER: lower seg1_angular (0.25=r0.72m)')
+            self._arc_cmd(self.uturn_seg1_speed, self.uturn_seg1_angular)
+            if now >= self._uturn_phase_end_t:
+                self._advance_uturn(UT_SEG2, self.uturn_seg2_secs)
+            return
+
+        if self._uturn_phase == UT_SEG2:
+            dist = self.uturn_seg2_speed*self.uturn_seg2_secs
+            self._uturn_debug(frame,roi_y,f'U-TURN ③ STRAIGHT  ~{dist:.2f}m',
+                f'linear={self.uturn_seg2_speed:.2f}  angular=0.0  '
+                f'MORE: raise uturn_seg2_secs ({self.uturn_seg2_secs:.1f}s)')
+            self._arc_cmd(self.uturn_seg2_speed, 0.0)
+            if now >= self._uturn_phase_end_t:
+                self._advance_uturn(UT_SEG3, self.uturn_seg3_secs)
+            return
+
+        if self._uturn_phase == UT_SEG3:
+            r3 = self.uturn_seg3_speed/max(self.uturn_seg3_angular,0.01)
+            self._uturn_debug(frame,roi_y,f'U-TURN ④ ARC-LEFT  r={r3:.2f}m',
+                f'linear={self.uturn_seg3_speed:.2f}  angular=+{self.uturn_seg3_angular:.2f}  '
+                f'completing 180 deg')
+            self._arc_cmd(self.uturn_seg3_speed, self.uturn_seg3_angular)
+            if now >= self._uturn_phase_end_t:
+                self._advance_uturn(UT_STR, self.uturn_str_secs)
+            return
+
+        if self._uturn_phase == UT_STR:
+            self._uturn_debug(frame,roi_y,'U-TURN ⑤ ALIGN','Straightening...')
+            self._arc_cmd(self.uturn_str_speed, 0.0)
+            if now >= self._uturn_phase_end_t:
+                self._uturn_phase          = UT_IDLE
+                self._uturn_cooldown_end_t = now + self.uturn_cooldown_secs
+                self._orange_confirm_count = 0
+                self._yellow_cx_smooth     = None
+                self._sweep_dir            = -1
+                self._sweep_right_done     = False
+                self._right_watch_count    = 0
+                self._reset_pd()
+                self.get_logger().info('U-TURN complete')
+            return
+
+        # ── NORMAL LANE FOLLOWING ──────────────────────────────────────────────
+
+        warped  = self._warp_birdseye(roi) if self.warp_enabled else roi
+        blurred = cv2.GaussianBlur(warped,(5,5),0)
+        hsv     = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+
+        white_mask  = cv2.inRange(hsv, self.white_lower,  self.white_upper)
+        yellow_mask = cv2.inRange(hsv, self.yellow_lower, self.yellow_upper)
+
+        orange_ok, o_info = self.detect_orange(hsv, rw, rh)
+        if orange_ok:
+            self.get_logger().warn('ORANGE -- U-turn start (mode=%s)' % self.uturn_mode)
+            self._corner_commit_frames = 0
+            if self.uturn_mode == 'orange':
+                self._uturn_phase             = UT_SPIN
+                self._spin_orange_lost_frames = 0
+                self._orange_confirm_count    = 0
+                self.pub.publish(Twist())
+            else:
+                self._advance_uturn(UT_BRAKE, self.uturn_brake_secs)
+            self._sweep_frame_count  = 0
+            self._sweep_dir          = -1
+            self._sweep_right_done   = False
+            self._right_watch_count  = 0
+            return
+
+        raw_wcx, w_cnts = self.get_cx_white(white_mask, rw)
+        _raw_ycx, y_cnts = self.get_cx_yellow(yellow_mask)  # runs but unused in steering
+        raw_ycx = None   # yellow does NOT steer the robot
+        y_cnts  = []
+
+        # Jump rejection for white
+        wcx = raw_wcx
+        if raw_wcx is not None and self._prev_white_cx is not None \
+                and abs(raw_wcx-self._prev_white_cx) > self.max_cx_jump_px:
+            wcx = self._prev_white_cx
+
+        if wcx is not None:
+            self._white_confirm_count = min(self._white_confirm_count+1,
+                                            self.white_confirm_frames+1)
+        else:
+            self._white_confirm_count = 0
+        self._white_confirmed = self._white_confirm_count >= self.white_confirm_frames
+        tw_cx = wcx if self._white_confirmed else None
+        ycx   = raw_ycx   # always None
+
+        if raw_wcx  is not None: self._prev_white_cx  = raw_wcx
+        if _raw_ycx is not None: self._prev_yellow_cx = _raw_ycx
+
+        y_guarded = False
+
+        # ── Sharp-right watch ─────────────────────────────────────────────────
+        if tw_cx is not None and tw_cx > int(rw * self.right_turn_watch_frac):
+            self._last_white_cx_for_right = self.right_turn_loss_memory_frames
+        elif self._last_white_cx_for_right is not None and self._last_white_cx_for_right > 0:
+            self._last_white_cx_for_right -= 1
+
+        white_far_right = (tw_cx is not None and tw_cx > int(rw * self.right_turn_watch_frac))
+        right_gap_small = True  # yellow disabled
+        if white_far_right and right_gap_small:
+            self._right_watch_count += 1
+        else:
+            self._right_watch_count = 0
+
+        if self._right_watch_count >= self.right_turn_watch_frames:
+            self._corner_commit_frames = self.right_turn_commit_frames
+            self._corner_commit_dir    = -1
+            self._right_watch_count    = 0
+            self.get_logger().warn('Sharp-right watch triggered -- committing RIGHT arc',
+                                   throttle_duration_sec=0.8)
+
+        if (tw_cx is None and ycx is None and self._last_white_cx_for_right is not None
+                and self._last_white_cx_for_right > 0 and self._corner_commit_frames == 0):
+            self._corner_commit_frames = self.right_turn_loss_commit_frames
+            self._corner_commit_dir    = -1
+            self._last_white_cx_for_right = 0
+            self.get_logger().warn('Sharp-right loss memory triggered',
+                                   throttle_duration_sec=0.8)
+
+        # Spread corner commit removed (required yellow)
+
+        # ── Corner commit ─────────────────────────────────────────────────────
+        if self._corner_commit_frames > 0:
+            self._corner_commit_frames -= 1
+            if self._corner_commit_frames == 0:
+                self._reset_pd()
+            dl  = 'LEFT' if self._corner_commit_dir > 0 else 'RIGHT'
+            if self._corner_commit_dir < 0:
+                rc  = self.right_turn_entry_speed/max(abs(self.right_turn_commit_angular),0.01)
+                ang = self.right_turn_commit_angular
+                lin = self.right_turn_entry_speed
+            else:
+                rc  = self.corner_commit_speed/max(self.corner_commit_angular,0.01)
+                ang = self.corner_commit_angular*self._corner_commit_dir
+                lin = self.corner_commit_speed
+            self._arc_cmd(lin, ang)
+            return
+
+        # ── Steering ──────────────────────────────────────────────────────────
+        twist    = Twist()
+        error    = None
+        target_x = None
+        status   = 'NO WHITE'
+        mode     = 'NONE'
+        spr_str  = ''
+
+        # WHITE-ONLY steering (yellow fully removed)
+        if tw_cx is not None:
+            target_x = tw_cx - int(rw*self.white_only_gap_frac) - self.total_offset_px
+            status   = 'WHITE-ONLY'; mode = 'WHITE-ONLY'
+
+        # ── Intersection commit ───────────────────────────────────────────────
+        if self._intersection_pending and self._intersection_commit_frames == 0:
+            self._intersection_pending       = False
+            self._intersection_commit_frames = self.intersection_commit_frames
+        if self._intersection_commit_frames > 0:
+            self._intersection_commit_frames -= 1
+            ang_dir = -1 if self._intersection_direction == 'right' else 1
+            it = Twist()
+            it.linear.x  = self.intersection_commit_speed
+            it.angular.z = self.intersection_commit_angular * ang_dir
+            self.pub.publish(it)
+            self.pub_lane.publish(it)
+            return
+
+        if target_x is not None:
+            error = target_x - (rw/2.0)
+
+        # Grace: decay last known error
+        if error is None and self._last_error is not None \
+                and self._lost_frames < self.lost_grace_frames:
+            decay = 1.0-(self._lost_frames/self.lost_grace_frames)*0.5
+            error = float(np.clip(self._last_error*decay,-60.0,60.0))
+            status = f'GRACE({self._lost_frames})'; mode = 'GRACE'
+            self._lost_frames += 1
+        elif error is not None:
+            self._last_error  = error
+            self._lost_frames = 0
+            self._sweep_frame_count  = 0
+            self._sweep_dir          = -1
+            self._sweep_right_done   = False
+            self._right_watch_count  = 0
+        else:
+            self._lost_frames += 1
+
+        if mode != self._prev_mode and mode not in ('GRACE',):
+            self._reset_pd()
+        self._prev_mode = mode
+
+        # Single debug publish -- throttled internally to 15fps
+        self._publish_debug(frame, roi_y, rh, rw,
+                            w_cnts, y_cnts, o_info,
+                            tw_cx, None, target_x,
+                            status, mode, spr_str, error, y_guarded)
+
+        if error is None:
+            # Recovery sweep -- looks RIGHT first (white is on right side)
+            ang_dir = -1
+            if not self._sweep_right_done:
+                if self._sweep_frame_count < self.sweep_right_priority_frames:
+                    ang_dir = -1
+                    self._sweep_frame_count += 1
+                else:
+                    self._sweep_right_done  = True
+                    self._sweep_frame_count = 0
+                    self._sweep_dir         = 1
+            else:
+                self._sweep_frame_count += 1
+                if self._sweep_frame_count >= self.sweep_frames_per_dir:
+                    self._sweep_dir         = -self._sweep_dir
+                    self._sweep_frame_count = 0
+                ang_dir = self._sweep_dir
+            self.get_logger().warn('Lost lines -- sweeping', throttle_duration_sec=1.0)
+            twist.linear.x  = self.sweep_linear_speed
+            twist.angular.z = self.sweep_angular * ang_dir
+            self.pub.publish(twist)
+            self.pub_lane.publish(twist)
+            return
+
+        self.get_logger().info(status+spr_str, throttle_duration_sec=0.5)
+
+        if self._obstacle_state == 'STOP':
+            self.pub.publish(Twist())
+            self.pub_lane.publish(Twist())
+            return
+
+        # Always WHITE-ONLY mode now
+        kp_scale = self.white_only_kp_scale
+        deadband = self.white_only_deadband_px
+        if tw_cx is not None and tw_cx > int(rw * self.right_turn_watch_frac * 0.95):
+            kp_scale *= self.right_turn_follow_gain
+        ang = self._compute_angular(error, kp_scale=kp_scale, deadband=deadband)
+        if tw_cx is not None and tw_cx > int(rw * self.right_turn_watch_frac * 0.95):
+            twist.linear.x = self.right_turn_entry_speed
+        else:
+            twist.linear.x = self.linear_speed if abs(ang) < 0.25 else self.turn_speed
+        twist.angular.z = ang
+        self.pub.publish(twist)
+        self.pub_lane.publish(twist)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = LaneFollower()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.pub.publish(Twist())
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+    
